@@ -5,38 +5,70 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #ifdef NOTIFY
 #include <libnotify/notify.h>
 #endif /* NOTIFY */
 
-#include "arg.h"
-
-char *argv0;
+#include "config.h"
 
 /* macros */
 #define LEN(a)  (sizeof(a) / sizeof(a[0]))
+#define MAX_PATH 4096
 
+static volatile sig_atomic_t suspend;
+static volatile int restart_timer = 0;
 
-typedef struct {
-	unsigned int tmr;
-	char *cmt;
-} Timers;
-
-#include "config.h"
-
-volatile static sig_atomic_t display, suspend;
+static int timer_idx = 0;
+static int remaining_sec = 0;
+static char status_path[MAX_PATH];
 
 /* function declarations */
+static void clean_status_file(void);
 static void die(const char *errstr, ...);
-static void spawn(char *argv[]);
+static void init_status_file(void);
+static void log_state(void);
 static void notify_send(char *cmt);
-static void display_state(int remaining, int suspend);
-static void toggle_display(int sigint);
-static void toggle_suspend(int sigint);
-static void usage(void);
+static void notify_state(void);
+static void register_signal(int signal, 
+                            void (*callback_fn)(int),
+                            const char* error_message,
+                            struct sigaction * sigaction);
+static void spawn(char *argv[]);
+static void sig_reset_timer(int sig);
+static void sig_shutdown_handler(int sig);
+static void sig_skip_timer(int sig);
+static void sig_suspend_timer(int sigint);
+
+typedef struct {
+    int sig;
+    void (*callback_fn)(int);
+    const char* error_message;
+} SignalHandler;
+
+static const SignalHandler sig_handlers_exit[] = {
+    { SIGINT,  sig_shutdown_handler, "cannot associate SIGINT to handler\n" },
+    { SIGTERM, sig_shutdown_handler, "cannot associate SIGTERM to handler\n" },
+    { SIGHUP,  sig_shutdown_handler, "cannot associate SIGHUP to handler\n" }
+};
+
+static const SignalHandler sig_handlers_ctrl[] = {
+    { 1, sig_suspend_timer, "cannot associate suspend signal to handler\n" },
+    { 2, sig_skip_timer, "cannot associate skip signal to handler\n" },
+    { 3, sig_reset_timer, "cannot associate reset signal to handler\n" },
+};
 
 /* functions implementations */
+
+void
+clean_status_file(void)
+{
+    remove(status_path);
+}
+
 void
 die(const char *errstr, ...)
 {
@@ -46,6 +78,121 @@ die(const char *errstr, ...)
 	vfprintf(stderr, errstr, ap);
 	va_end(ap);
 	exit(1);
+}
+
+void
+init_status_file(void)
+{
+	uid_t uid;
+	struct stat st;
+	const char *xdg_runtime;
+    FILE* status_file;
+
+	if ((xdg_runtime = getenv("XDG_RUNTIME_DIR")) != NULL)
+		snprintf(status_path, sizeof(status_path), "%s/spt/", xdg_runtime);
+	else {
+		uid = getuid();
+		snprintf(status_path, sizeof(status_path), "/run/user/%u/spt/", uid);
+	}
+
+	if (stat(status_path, &st) == -1) {
+		if (mkdir(status_path, 0700) == -1)
+			die("cannot create path for status file");
+	}
+
+    strcat(status_path, "status");
+
+    printf("Create %s\n", status_path);
+	status_file = fopen(status_path, "w");
+	if (status_file == NULL)
+		die("cannot create status file");
+    fclose(status_file);
+}
+
+void
+log_state(void)
+{
+	char buf[36];
+	snprintf(buf, 36, "%s %02d:%02d%s",
+         (timer_idx & 1 ? "break" : "focus"),
+         remaining_sec / 60,
+		 remaining_sec % 60,
+		 (suspend) ? " paused" : "" );
+    FILE* status_file = fopen(status_path, "w");
+    fprintf(status_file, "%s", buf);
+    fclose(status_file);
+}
+
+void
+notify_send(char *cmt)
+{
+	if (strcmp(notifycmd, ""))
+		spawn((char *[]) { notifycmd, "spt", cmt, NULL });
+#ifdef NOTIFY
+	else {
+		notify_init("spt");
+		NotifyNotification *n = notify_notification_new("Pomodoro", cmt, \
+					"alarm-clock");
+		notify_notification_show(n, NULL);
+		g_object_unref(G_OBJECT(n));
+		notify_uninit();
+	}
+#endif /* NOTIFY */
+
+	if (strcmp(notifyext, "")) /* extra commands to use */
+		spawn((char *[]) { "/bin/sh", "-c", notifyext, NULL });
+}
+
+void
+notify_state(void)
+{
+	char buf[64];
+	snprintf(buf, 64, "%s time%s %02d:%02d",
+		 (timer_idx & 1 ? "Break" : "Focus"),
+         (suspend ? " paused on" : ""),
+         remaining_sec / 60,
+		 remaining_sec % 60);
+    notify_send(buf);
+}
+
+void register_signal(int signal, 
+                     void(*callback_fn)(int),
+                     const char* error_message,
+                     struct sigaction * sa)
+{
+	sa->sa_handler = callback_fn;
+	sigemptyset(&sa->sa_mask);
+	sa->sa_flags = 0;
+
+	if (sigaction(signal, sa, NULL) == -1)
+		die(error_message);
+}
+
+void
+sig_reset_timer(int sig)
+{
+    timer_idx = -1;
+    restart_timer = 1;
+}
+
+void
+sig_shutdown_handler(int sig)
+{
+	clean_status_file();
+	exit(0);
+}
+
+void 
+sig_skip_timer(int sig) 
+{
+    restart_timer = 1;
+}
+
+void
+sig_suspend_timer(int sigint)
+{
+	suspend ^= 1;
+    notify_state();
 }
 
 void
@@ -60,113 +207,53 @@ spawn(char *argv[])
 	}
 }
 
-void
-notify_send(char *cmt)
-{
-	if (strcmp(notifycmd, ""))
-		spawn((char *[]) { notifycmd, "spt", cmt, NULL });
-#ifdef NOTIFY
-	else {
-		notify_init("spt");
-		NotifyNotification *n = notify_notification_new("spt", cmt, \
-					"dialog-information");
-		notify_notification_show(n, NULL);
-		g_object_unref(G_OBJECT(n));
-		notify_uninit();
-	}
-#endif /* NOTIFY */
-
-	if (strcmp(notifyext, "")) /* extra commands to use */
-		spawn((char *[]) { "/bin/sh", "-c", notifyext, NULL });
-}
-
-void
-display_state(int remaining, int suspend)
-{
-	char buf[29];
-
-	snprintf(buf, 29, "Remaining: %02d:%02d %s",
-		 remaining / 60,
-		 remaining % 60,
-		 (suspend) ? "◼" : "▶");
-
-	notify_send(buf);
-	display = 0;
-}
-
-void
-toggle_display(int sigint)
-{
-	display = 1;
-}
-
-void
-toggle_suspend(int sigint)
-{
-	suspend ^= 1;
-}
-
-void
-usage(void)
-{
-	die("usage: %s [-e notifyext] [-n notifycmd] [-v]\n", argv0);
-}
-
 int
 main(int argc, char *argv[])
 {
+    init_status_file();
 	struct timespec remaining;
 	struct sigaction sa;
 	sigset_t emptymask;
 	int i;
 
-	ARGBEGIN {
-		case 'e':
-			notifyext = EARGF(usage());
-			break;
-		case 'n':
-			notifycmd = EARGF(usage());
-			break;
-		case 'v':
-			die("spt " VERSION " © 2015-2020 spt engineers, "
-			    "see LICENSE for details\n");
-		default:
-			usage();
-	} ARGEND;
-
-	/* add SIGUSR1 handler: remaining_time */
-	sa.sa_handler = toggle_display;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-
-	if (sigaction(SIGUSR1, &sa, NULL) == -1)
-		die("cannot associate SIGUSR1 to handler\n");
-
-	/* add SIGUSR2 handler: toggle */
-	sa.sa_handler = toggle_suspend;
-	sigemptyset(&sa.sa_mask);
-	sa.sa_flags = 0;
-
-	if (sigaction(SIGUSR2, &sa, NULL) == -1)
-		die("cannot associate SIGUSR2 to handler\n");
-
+    /* Exit signals (SIGINT, SIGTERM, SIGHUP) */
+    for (i = 0; i < LEN(sig_handlers_exit); i++) {
+        register_signal(sig_handlers_exit[i].sig, 
+                        sig_handlers_exit[i].callback_fn,
+                        sig_handlers_exit[i].error_message, &sa);
+    }
+    /* Control signals: suspend, skip, reset */
+    for (i = 0; i < LEN(sig_handlers_ctrl); i++) {
+        register_signal(sig_handlers_ctrl[i].sig + SIGRTMIN, 
+                        sig_handlers_ctrl[i].callback_fn,
+                        sig_handlers_ctrl[i].error_message, &sa);
+    }
 	sigemptyset(&emptymask);
 
-	for (i = 0; ; i = (i + 1) % LEN(timers)) {
-		notify_send(timers[i].cmt);
-		remaining.tv_sec = timers[i].tmr;
-		remaining.tv_nsec = 0;
-		while (remaining.tv_sec) {
-			if (display)
-				display_state(remaining.tv_sec, suspend);
+    // sigsuspend(&emptymask);
+	for (timer_idx = 0; ; timer_idx = (timer_idx + 1) % LEN(timers)) {
+        remaining_sec = timers[timer_idx];
+	    notify_state();
+        while (remaining_sec > 0) {
+            remaining.tv_sec = 1;
+            remaining.tv_nsec = 0;
 
-			if (suspend)
-				sigsuspend(&emptymask);
-			else
-				if (nanosleep(&remaining, &remaining) == 0)
-					remaining.tv_sec = remaining.tv_nsec = 0;
-		}
-	}
+            log_state();
+            while (remaining.tv_sec) {
+                if (suspend)
+                    sigsuspend(&emptymask);
+                else if (restart_timer || nanosleep(&remaining, &remaining) == 0)
+                        remaining.tv_sec = remaining.tv_nsec = 0;
+            }
+
+            if (restart_timer) {
+                restart_timer = 0;
+                break;
+            }
+
+            remaining_sec--;
+        }
+    }
 
 	return 0;
 }

@@ -17,7 +17,7 @@ LIBS+= `pkg-config --libs libnotify`
 
 # flags
 CPPFLAGS += -DVERSION=\"${VERSION}\" -D_POSIX_C_SOURCE=199309
-CFLAGS += -g -std=c99 -pedantic -Wall -Os ${INCS} ${DEFS} ${CPPFLAGS}
+CFLAGS += -g -std=c99 -pedantic -Wall -Werror -Os ${INCS} ${DEFS} ${CPPFLAGS}
 LDFLAGS += -g ${LIBS}
 
 # compiler and linker

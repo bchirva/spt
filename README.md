@@ -7,7 +7,11 @@ Features
 --------
 - Get the jobs done quicker than ever
 - Keeps you free like a dog
-- Able to show remaining time
+- Currents status: remaining time and timers type (focus/break) is written into `$XDG_RUNTIME_DIR/spt/status`
+- Control via system signals:
+    - `SIGRTMIN + 1` - to pause/continue
+    - `SIGRTMIN + 2` - to skip current timer
+    - `SIGRTMIN + 3` - to reset timer to first
 
 Installation
 ------------
